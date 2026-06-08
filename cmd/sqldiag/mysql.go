@@ -11,6 +11,7 @@ import (
 
 	"github.com/sqldiag/sqldiag/internal/aggregator"
 	"github.com/sqldiag/sqldiag/internal/collector"
+	"github.com/sqldiag/sqldiag/internal/metrics"
 	"github.com/sqldiag/sqldiag/internal/model"
 	"github.com/sqldiag/sqldiag/internal/report"
 )
@@ -20,6 +21,10 @@ var (
 	mysqlPID     int
 	duration     time.Duration
 	symbolOffset uint64
+	enableMetrics bool
+	metricsAddr   string
+	noPlan        bool
+	noAnomaly     bool
 )
 
 var mysqlCmd = &cobra.Command{
@@ -41,6 +46,10 @@ func init() {
 	mysqlCmd.Flags().IntVar(&mysqlPID, "pid", 0, "MySQL process ID (optional, auto-detected by port)")
 	mysqlCmd.Flags().DurationVar(&duration, "duration", 0, "Monitoring duration (e.g., 1h, 30m). 0 means run until interrupted")
 	mysqlCmd.Flags().Uint64Var(&symbolOffset, "symbol-offset", 0, "Manual symbol offset for dispatch_command (for stripped binaries)")
+	mysqlCmd.Flags().BoolVar(&enableMetrics, "metrics", false, "Enable Prometheus metrics exporter")
+	mysqlCmd.Flags().StringVar(&metricsAddr, "metrics-addr", ":9090", "Prometheus metrics server address")
+	mysqlCmd.Flags().BoolVar(&noPlan, "no-plan", false, "Disable execution plan capture")
+	mysqlCmd.Flags().BoolVar(&noAnomaly, "no-anomaly", false, "Disable anomaly detection")
 	rootCmd.AddCommand(mysqlCmd)
 }
 
@@ -50,8 +59,20 @@ func runMySQL(cmd *cobra.Command, args []string) error {
 	}
 
 	agg := aggregator.NewAggregator(thresholdMs, time.Now())
+	agg.EnableAnomalyDetection(!noAnomaly)
+
 	formatter := report.NewFormatter(thresholdMs)
 	c := collector.NewCollector()
+	c.SetCapturePlan(!noPlan)
+
+	var exporter *metrics.Exporter
+	if enableMetrics {
+		exporter = metrics.NewExporter(metricsAddr, "/metrics")
+		if err := exporter.Start(); err != nil {
+			return fmt.Errorf("start metrics server: %w", err)
+		}
+		defer exporter.Stop()
+	}
 
 	var err error
 	if mysqlPID > 0 {
@@ -71,6 +92,15 @@ func runMySQL(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Monitoring MySQL slow queries...")
 	fmt.Printf("Threshold: %.0fms\n", thresholdMs)
+	if !noPlan {
+		fmt.Println("Execution plan capture: enabled")
+	}
+	if !noAnomaly {
+		fmt.Println("Anomaly detection: enabled (3σ threshold)")
+	}
+	if enableMetrics {
+		fmt.Printf("Metrics: enabled on %s/metrics\n", metricsAddr)
+	}
 	fmt.Println("Press Ctrl+C to stop")
 	fmt.Println()
 
@@ -89,6 +119,11 @@ func runMySQL(cmd *cobra.Command, args []string) error {
 	statsTicker := time.NewTicker(1 * time.Second)
 	defer statsTicker.Stop()
 
+	alertTicker := time.NewTicker(5 * time.Second)
+	defer alertTicker.Stop()
+
+	var lastAlertCount int
+
 	for {
 		select {
 		case event := <-c.Events():
@@ -96,6 +131,9 @@ func runMySQL(cmd *cobra.Command, args []string) error {
 				continue
 			}
 			agg.Add(event)
+			if exporter != nil {
+				exporter.ObserveEvent(event, thresholdMs)
+			}
 			if !outputJSON {
 				formatter.PrintSlowQuery(event)
 			}
@@ -104,6 +142,21 @@ func runMySQL(cmd *cobra.Command, args []string) error {
 			if !outputJSON {
 				total, slow := agg.GetStats()
 				formatter.PrintLiveStats(total, slow)
+			}
+
+		case <-alertTicker.C:
+			if !noAnomaly && !outputJSON {
+				alerts := agg.AnomalyAlerts()
+				if len(alerts) > lastAlertCount {
+					for i := lastAlertCount; i < len(alerts); i++ {
+						alert := alerts[i]
+						printAnomalyAlert(alert)
+						if exporter != nil {
+							exporter.ObserveAnomaly(alert, "", "")
+						}
+					}
+					lastAlertCount = len(alerts)
+				}
 			}
 
 		case <-sigChan:
@@ -117,6 +170,15 @@ func runMySQL(cmd *cobra.Command, args []string) error {
 			return printFinalReport(agg, formatter)
 		}
 	}
+}
+
+func printAnomalyAlert(alert *model.AnomalyAlert) {
+	fmt.Printf("\n%s ANOMALY ALERT [%s] %s\n",
+		alert.Timestamp.Format("15:04:05"),
+		alert.Severity,
+		alert.Fingerprint)
+	fmt.Printf("  Current: %.2fms, Mean: %.2fms, StdDev: %.2fms, Z-Score: %.2f\n\n",
+		alert.CurrentDuration, alert.Mean, alert.StdDev, alert.ZScore)
 }
 
 func printFinalReport(agg *aggregator.Aggregator, formatter *report.Formatter) error {

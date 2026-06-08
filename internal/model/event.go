@@ -14,18 +14,21 @@ const (
 )
 
 type Event struct {
-	PID          uint32    `json:"pid"`
-	TID          uint32    `json:"tid"`
-	StartNano    uint64    `json:"start_nano"`
-	EndNano      uint64    `json:"end_nano"`
-	DurationNano uint64    `json:"duration_nano"`
-	Command      uint32    `json:"command"`
-	User         string    `json:"user"`
-	DB           string    `json:"db"`
-	ClientIP     string    `json:"client_ip"`
-	ClientPort   uint16    `json:"client_port"`
-	SQL          string    `json:"sql"`
-	Timestamp    time.Time `json:"timestamp"`
+	PID                uint32    `json:"pid"`
+	TID                uint32    `json:"tid"`
+	StartNano          uint64    `json:"start_nano"`
+	EndNano            uint64    `json:"end_nano"`
+	DurationNano       uint64    `json:"duration_nano"`
+	Command            uint32    `json:"command"`
+	User               string    `json:"user"`
+	DB                 string    `json:"db"`
+	ClientIP           string    `json:"client_ip"`
+	ClientPort         uint16    `json:"client_port"`
+	SQL                string    `json:"sql"`
+	SQLFingerprint     string    `json:"sql_fingerprint"`
+	SQLFingerprintHash uint64    `json:"sql_fingerprint_hash"`
+	ExecutionPlan      string    `json:"execution_plan"`
+	Timestamp          time.Time `json:"timestamp"`
 }
 
 func (e *Event) DurationMs() float64 {
@@ -60,16 +63,35 @@ type AggregateStats struct {
 	P95Duration   float64 `json:"p95_duration_ms"`
 }
 
+type FingerprintStats struct {
+	AggregateStats
+	Fingerprint string `json:"fingerprint"`
+	ExampleSQL  string `json:"example_sql"`
+}
+
 type Report struct {
-	GeneratedAt    time.Time                  `json:"generated_at"`
-	Since          time.Time                  `json:"since"`
-	TotalQueries   int64                      `json:"total_queries"`
-	SlowQueries    int64                      `json:"slow_queries"`
-	ThresholdMs    float64                    `json:"threshold_ms"`
-	ByUser         map[string]*AggregateStats `json:"by_user"`
-	ByDB           map[string]*AggregateStats `json:"by_db"`
-	ByClientIP     map[string]*AggregateStats `json:"by_client_ip"`
-	TopSlowQueries []*Event                   `json:"top_slow_queries"`
+	GeneratedAt     time.Time                    `json:"generated_at"`
+	Since           time.Time                    `json:"since"`
+	TotalQueries    int64                        `json:"total_queries"`
+	SlowQueries     int64                        `json:"slow_queries"`
+	ThresholdMs     float64                      `json:"threshold_ms"`
+	ByUser          map[string]*AggregateStats   `json:"by_user"`
+	ByDB            map[string]*AggregateStats   `json:"by_db"`
+	ByClientIP      map[string]*AggregateStats   `json:"by_client_ip"`
+	ByFingerprint   map[uint64]*FingerprintStats `json:"by_fingerprint"`
+	TopSlowQueries  []*Event                     `json:"top_slow_queries"`
+	AnomalyAlerts   []*AnomalyAlert              `json:"anomaly_alerts,omitempty"`
+}
+
+type AnomalyAlert struct {
+	Timestamp       time.Time `json:"timestamp"`
+	FingerprintHash uint64    `json:"fingerprint_hash"`
+	Fingerprint     string    `json:"fingerprint"`
+	CurrentDuration float64   `json:"current_duration_ms"`
+	Mean            float64   `json:"mean_ms"`
+	StdDev          float64   `json:"stddev_ms"`
+	ZScore          float64   `json:"z_score"`
+	Severity        string    `json:"severity"`
 }
 
 func (r *Report) ToJSON() (string, error) {

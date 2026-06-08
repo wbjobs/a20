@@ -9,6 +9,7 @@
 #define MAX_USER_LEN 128
 #define MAX_DB_LEN 128
 #define MAX_IP_LEN 48
+#define MAX_PLAN_LEN 4096
 #define SLOW_QUERY_THRESHOLD_NS (100ULL * 1000000ULL)
 
 enum server_command {
@@ -55,6 +56,8 @@ struct start_info {
     char client_ip[MAX_IP_LEN];
     u16 client_port;
     char sql[MAX_SQL_LEN];
+    char plan[MAX_PLAN_LEN];
+    u32 plan_len;
 };
 
 struct event {
@@ -66,10 +69,12 @@ struct event {
     u32 command;
     u32 sql_len;
     u16 client_port;
+    u32 plan_len;
     char user[MAX_USER_LEN];
     char db[MAX_DB_LEN];
     char client_ip[MAX_IP_LEN];
     char sql[MAX_SQL_LEN];
+    char plan[MAX_PLAN_LEN];
 };
 
 struct {
@@ -253,9 +258,67 @@ int BPF_URETPROBE(dispatch_command_exit, int ret) {
     __builtin_memcpy(event->db, info->db, MAX_DB_LEN);
     __builtin_memcpy(event->client_ip, info->client_ip, MAX_IP_LEN);
     __builtin_memcpy(event->sql, info->sql, MAX_SQL_LEN);
+    event->plan_len = info->plan_len;
+    if (info->plan_len > 0) {
+        __builtin_memcpy(event->plan, info->plan, MAX_PLAN_LEN);
+    }
 
     bpf_ringbuf_submit(event, BPF_RB_NO_WAKEUP);
     bpf_map_delete_elem(&start_map, &tid);
+
+    return 0;
+}
+
+SEC("uprobe/_ZN4JOIN8optimizeEv")
+int BPF_UPROBE(join_optimize_entry) {
+    u64 tid = bpf_get_current_pid_tgid();
+    u64 ts = bpf_ktime_get_ns();
+
+    struct start_info *info = bpf_map_lookup_elem(&start_map, &tid);
+    if (!info) {
+        return 0;
+    }
+
+    info->plan_len = 0;
+
+    char plan_info[MAX_PLAN_LEN];
+    __builtin_memset(plan_info, 0, sizeof(plan_info));
+
+    const char *tag = "JOIN::optimize called";
+    int tag_len = 20;
+    if (tag_len < MAX_PLAN_LEN) {
+        __builtin_memcpy(plan_info, tag, tag_len);
+        info->plan_len = tag_len;
+    }
+
+    __builtin_memcpy(info->plan, plan_info, MAX_PLAN_LEN);
+    return 0;
+}
+
+SEC("uretprobe/_ZN4JOIN8optimizeEv")
+int BPF_URETPROBE(join_optimize_exit, int ret) {
+    u64 tid = bpf_get_current_pid_tgid();
+    u64 ts = bpf_ktime_get_ns();
+
+    struct start_info *info = bpf_map_lookup_elem(&start_map, &tid);
+    if (!info) {
+        return 0;
+    }
+
+    char ret_str[32];
+    int len = 0;
+    if (ret == 0) {
+        len = 18;
+        __builtin_memcpy(ret_str, " optimize success", 18);
+    } else {
+        len = 15;
+        __builtin_memcpy(ret_str, " optimize failed", 15);
+    }
+
+    if (info->plan_len + len < MAX_PLAN_LEN) {
+        __builtin_memcpy(info->plan + info->plan_len, ret_str, len);
+        info->plan_len += len;
+    }
 
     return 0;
 }

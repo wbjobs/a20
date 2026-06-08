@@ -39,7 +39,13 @@ func (f *Formatter) PrintSlowQuery(event *model.Event) {
 	if event.ClientIP != "" {
 		fmt.Printf("  Client:  %s:%d\n", event.ClientIP, event.ClientPort)
 	}
+	if event.SQLFingerprint != "" {
+		fmt.Printf("  Fingerprint: %s\n", f.truncateSQL(event.SQLFingerprint, 100))
+	}
 	fmt.Printf("  SQL:     %s\n", f.truncateSQL(event.SQL, 200))
+	if event.ExecutionPlan != "" {
+		fmt.Printf("  Plan:    %s\n", event.ExecutionPlan)
+	}
 }
 
 func (f *Formatter) truncateSQL(sql string, maxLen int) string {
@@ -59,6 +65,9 @@ func (f *Formatter) PrintReport(report *model.Report) {
 	fmt.Printf("  Total Queries: %d\n", report.TotalQueries)
 	fmt.Printf("  Slow Queries:  %d (%.2f%%)\n", report.SlowQueries,
 		float64(report.SlowQueries)/float64(report.TotalQueries)*100)
+	if len(report.AnomalyAlerts) > 0 {
+		fmt.Printf("  Anomaly Alerts: %d\n", len(report.AnomalyAlerts))
+	}
 	fmt.Println()
 
 	f.PrintAggregateTable("By User", report.ByUser)
@@ -67,6 +76,12 @@ func (f *Formatter) PrintReport(report *model.Report) {
 	fmt.Println()
 	f.PrintAggregateTable("By Client IP", report.ByClientIP)
 	fmt.Println()
+	f.PrintFingerprintTable("By SQL Fingerprint", report.ByFingerprint)
+	fmt.Println()
+	if len(report.AnomalyAlerts) > 0 {
+		f.PrintAnomalyTable("Anomaly Alerts", report.AnomalyAlerts)
+		fmt.Println()
+	}
 	f.PrintTopSlowQueries(report.TopSlowQueries)
 }
 
@@ -143,6 +158,97 @@ func (f *Formatter) valueOrDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+func (f *Formatter) PrintFingerprintTable(title string, data map[uint64]*model.FingerprintStats) {
+	if len(data) == 0 {
+		return
+	}
+
+	fmt.Printf("  %s\n", title)
+	fmt.Println("  " + strings.Repeat("-", 76))
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"#", "Count", "Total(ms)", "Avg(ms)", "P95(ms)", "Max(ms)", "Min(ms)", "Fingerprint"})
+	table.SetAutoWrapText(false)
+	table.SetBorder(true)
+	table.SetCenterSeparator("|")
+	table.SetColumnSeparator("|")
+	table.SetRowSeparator("-")
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_RIGHT)
+	table.SetColWidth(20)
+
+	keys := make([]uint64, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return data[keys[i]].TotalDuration > data[keys[j]].TotalDuration
+	})
+
+	topCount := len(keys)
+	if topCount > 10 {
+		topCount = 10
+	}
+
+	for idx := 0; idx < topCount; idx++ {
+		stats := data[keys[idx]]
+		fp := f.truncateSQL(stats.Fingerprint, 40)
+		table.Append([]string{
+			fmt.Sprintf("%d", idx+1),
+			fmt.Sprintf("%d", stats.Count),
+			fmt.Sprintf("%.2f", stats.TotalDuration),
+			fmt.Sprintf("%.2f", stats.AvgDuration),
+			fmt.Sprintf("%.2f", stats.P95Duration),
+			fmt.Sprintf("%.2f", stats.MaxDuration),
+			fmt.Sprintf("%.2f", stats.MinDuration),
+			fp,
+		})
+	}
+
+	table.Render()
+}
+
+func (f *Formatter) PrintAnomalyTable(title string, alerts []*model.AnomalyAlert) {
+	if len(alerts) == 0 {
+		return
+	}
+
+	fmt.Printf("  %s\n", title)
+	fmt.Println("  " + strings.Repeat("-", 76))
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"Time", "Severity", "Z-Score", "Current(ms)", "Mean(ms)", "StdDev(ms)", "Fingerprint"})
+	table.SetAutoWrapText(false)
+	table.SetBorder(true)
+	table.SetCenterSeparator("|")
+	table.SetColumnSeparator("|")
+	table.SetRowSeparator("-")
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_RIGHT)
+	table.SetColWidth(20)
+
+	displayCount := len(alerts)
+	if displayCount > 20 {
+		displayCount = 20
+	}
+
+	for i := len(alerts) - displayCount; i < len(alerts); i++ {
+		alert := alerts[i]
+		fp := f.truncateSQL(alert.Fingerprint, 40)
+		table.Append([]string{
+			alert.Timestamp.Format("15:04:05"),
+			alert.Severity,
+			fmt.Sprintf("%.2f", alert.ZScore),
+			fmt.Sprintf("%.2f", alert.CurrentDuration),
+			fmt.Sprintf("%.2f", alert.Mean),
+			fmt.Sprintf("%.2f", alert.StdDev),
+			fp,
+		})
+	}
+
+	table.Render()
 }
 
 func (f *Formatter) PrintLiveStats(total int64, slow int64) {

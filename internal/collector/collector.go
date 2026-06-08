@@ -17,6 +17,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 
 	bpf "github.com/sqldiag/sqldiag/internal/ebpf"
+	"github.com/sqldiag/sqldiag/internal/fingerprint"
 	"github.com/sqldiag/sqldiag/internal/model"
 )
 
@@ -29,30 +30,39 @@ type bpfEvent struct {
 	Command    uint32
 	SqlLen     uint32
 	ClientPort uint16
-	Pad        [2]byte
+	PlanLen    uint32
 	User       [128]byte
 	Db         [128]byte
 	ClientIp   [48]byte
 	Sql        [16384]byte
+	Plan       [4096]byte
 }
 
 type Collector struct {
-	objs          *bpf.MysqlObjects
-	uprobeLink    link.Link
-	uretprobeLink link.Link
-	ringbuf       *ringbuf.Reader
-	mysqlPath     string
-	mysqlPid      int
-	symbolOffset  uint64
-	thresholdNs   uint64
-	running       bool
-	eventChan     chan *model.Event
+	objs              *bpf.MysqlObjects
+	uprobeLink        link.Link
+	uretprobeLink     link.Link
+	joinOptLink       link.Link
+	joinOptRetLink    link.Link
+	ringbuf           *ringbuf.Reader
+	mysqlPath         string
+	mysqlPid          int
+	symbolOffset      uint64
+	thresholdNs       uint64
+	capturePlan       bool
+	running           bool
+	eventChan         chan *model.Event
 }
 
 func NewCollector() *Collector {
 	return &Collector{
-		eventChan: make(chan *model.Event, 10240),
+		eventChan:   make(chan *model.Event, 10240),
+		capturePlan: true,
 	}
+}
+
+func (c *Collector) SetCapturePlan(capture bool) {
+	c.capturePlan = capture
 }
 
 func (c *Collector) AttachByPort(port int, thresholdMs float64) error {
@@ -133,6 +143,31 @@ func (c *Collector) Attach(mysqlBinary string, pid int, offset uint64, threshold
 		return fmt.Errorf("attach uretprobe: %w", err)
 	}
 
+	if c.capturePlan && c.objs.JoinOptimizeEntry != nil && c.objs.JoinOptimizeExit != nil {
+		joinOptSymbol := "_ZN4JOIN8optimizeEv"
+		_, err = findSymbolOffset(mysqlBinary, joinOptSymbol)
+		if err == nil {
+			joinOpts := &link.UprobeOptions{
+				PID: pid,
+			}
+			c.joinOptLink, err = exec.Uprobe(joinOptSymbol, c.objs.JoinOptimizeEntry, joinOpts)
+			if err != nil {
+				log.Printf("warning: attach JOIN::optimize uprobe: %v (continuing without plan capture)", err)
+			} else {
+				c.joinOptRetLink, err = exec.Uretprobe(joinOptSymbol, c.objs.JoinOptimizeExit, joinOpts)
+				if err != nil {
+					log.Printf("warning: attach JOIN::optimize uretprobe: %v (continuing without plan capture)", err)
+					if c.joinOptLink != nil {
+						c.joinOptLink.Close()
+						c.joinOptLink = nil
+					}
+				}
+			}
+		} else {
+			log.Printf("warning: JOIN::optimize symbol not found, execution plan capture disabled")
+		}
+	}
+
 	c.ringbuf, err = ringbuf.NewReader(c.objs.Events)
 	if err != nil {
 		return fmt.Errorf("create ringbuf reader: %w", err)
@@ -209,6 +244,19 @@ func parseEvent(data []byte) (*model.Event, error) {
 		event.SQL = nullTerminatedString(bpfEvt.Sql[:sqlLen])
 	}
 
+	if event.SQL != "" {
+		event.SQLFingerprint = fingerprint.Normalize(event.SQL)
+		event.SQLFingerprintHash = fingerprint.Hash(event.SQL)
+	}
+
+	planLen := int(bpfEvt.PlanLen)
+	if planLen > 4096 {
+		planLen = 4096
+	}
+	if planLen > 0 && planLen <= len(bpfEvt.Plan) {
+		event.ExecutionPlan = nullTerminatedString(bpfEvt.Plan[:planLen])
+	}
+
 	return event, nil
 }
 
@@ -227,6 +275,12 @@ func (c *Collector) Events() <-chan *model.Event {
 func (c *Collector) Close() {
 	c.running = false
 
+	if c.joinOptRetLink != nil {
+		c.joinOptRetLink.Close()
+	}
+	if c.joinOptLink != nil {
+		c.joinOptLink.Close()
+	}
 	if c.uretprobeLink != nil {
 		c.uretprobeLink.Close()
 	}

@@ -12,6 +12,8 @@ import (
 type MysqlObjects struct {
 	DispatchCommandEntry *ebpf.Program `ebpf:"dispatch_command_entry"`
 	DispatchCommandExit  *ebpf.Program `ebpf:"dispatch_command_exit"`
+	JoinOptimizeEntry    *ebpf.Program `ebpf:"join_optimize_entry"`
+	JoinOptimizeExit     *ebpf.Program `ebpf:"join_optimize_exit"`
 	StartMap             *ebpf.Map     `ebpf:"start_map"`
 	Events               *ebpf.Map     `ebpf:"events"`
 	ConfigMap            *ebpf.Map     `ebpf:"config_map"`
@@ -23,6 +25,12 @@ func (m *MysqlObjects) Close() error {
 	}
 	if m.DispatchCommandExit != nil {
 		m.DispatchCommandExit.Close()
+	}
+	if m.JoinOptimizeEntry != nil {
+		m.JoinOptimizeEntry.Close()
+	}
+	if m.JoinOptimizeExit != nil {
+		m.JoinOptimizeExit.Close()
 	}
 	if m.StartMap != nil {
 		m.StartMap.Close()
