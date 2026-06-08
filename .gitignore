@@ -1,34 +1,26 @@
-﻿# System
-.DS_Store
-Thumbs.db
-desktop.ini
+﻿# Build artifacts
+bin/
+*.exe
+*.o
+*.so
 
-# Logs
-*.log
-logs/
-
-# Temp
-*.tmp
-*.bak
-*.swp
-
-# Build / Dependencies
-node_modules/
-dist/
-build/
-out/
-venv/
-env/
-__pycache__/
-*.pyc
+# eBPF generated files
+internal/ebpf/mysql_bpfel.go
+internal/ebpf/mysql_bpfel.o
 
 # IDE
 .idea/
 .vscode/
-*.suo
-*.user
-*.sln.cache
+*.swp
+*.swo
+*~
 
-# Env
-.env
-.env.local
+# Go
+*.test
+*.out
+coverage.out
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db
