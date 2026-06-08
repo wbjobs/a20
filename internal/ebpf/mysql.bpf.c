@@ -5,10 +5,11 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
-#define MAX_SQL_LEN 4096
+#define MAX_SQL_LEN 16384
 #define MAX_USER_LEN 128
 #define MAX_DB_LEN 128
 #define MAX_IP_LEN 48
+#define SLOW_QUERY_THRESHOLD_NS (100ULL * 1000000ULL)
 
 enum server_command {
     COM_SLEEP = 0,
@@ -45,6 +46,17 @@ enum server_command {
     COM_RESET_CONNECTION = 31,
 };
 
+struct start_info {
+    u64 start_ns;
+    u32 command;
+    u32 sql_len;
+    char user[MAX_USER_LEN];
+    char db[MAX_DB_LEN];
+    char client_ip[MAX_IP_LEN];
+    u16 client_port;
+    char sql[MAX_SQL_LEN];
+};
+
 struct event {
     u32 pid;
     u32 tid;
@@ -52,49 +64,94 @@ struct event {
     u64 end_ns;
     u64 duration_ns;
     u32 command;
+    u32 sql_len;
+    u16 client_port;
     char user[MAX_USER_LEN];
     char db[MAX_DB_LEN];
     char client_ip[MAX_IP_LEN];
-    u16 client_port;
-    u32 sql_len;
-    char sql[MAX_SQL_LEN];
-};
-
-struct start_info {
-    u64 start_ns;
-    u32 command;
-    char user[MAX_USER_LEN];
-    char db[MAX_DB_LEN];
-    char client_ip[MAX_IP_LEN];
-    u16 client_port;
-    u32 sql_len;
     char sql[MAX_SQL_LEN];
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
+    __uint(max_entries, 8192);
     __type(key, u64);
     __type(value, struct start_info);
 } start_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 64 * 1024 * 1024);
+    __uint(max_entries, 32 * 1024 * 1024);
 } events SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} config_map SEC(".maps");
+
 static inline int read_sql_from_packet(char *packet, u32 packet_len, char *sql, u32 sql_buf_len, u32 *out_sql_len) {
-    if (packet_len < 1) {
+    if (packet_len < 2) {
         return -1;
     }
+
     u32 actual_sql_len = packet_len - 1;
+    if (actual_sql_len == 0) {
+        *out_sql_len = 0;
+        return 0;
+    }
+
     if (actual_sql_len > sql_buf_len - 1) {
         actual_sql_len = sql_buf_len - 1;
     }
-    __builtin_memcpy(sql, packet + 1, actual_sql_len);
+
+    long ret = bpf_probe_read_user(sql, actual_sql_len, packet + 1);
+    if (ret < 0) {
+        return -1;
+    }
+
     sql[actual_sql_len] = '\0';
     *out_sql_len = actual_sql_len;
     return 0;
+}
+
+static inline void read_sql_from_packet_v2(char *packet, u32 packet_len, struct start_info *info) {
+    if (packet_len <= 1) {
+        return;
+    }
+
+    u32 remaining = packet_len - 1;
+    u32 offset = 1;
+    u32 copied = 0;
+    const u32 chunk_size = 512;
+
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        if (copied >= MAX_SQL_LEN - 1) break;
+        if (remaining == 0) break;
+
+        u32 to_copy = remaining < chunk_size ? remaining : chunk_size;
+        if (to_copy > MAX_SQL_LEN - 1 - copied) {
+            to_copy = MAX_SQL_LEN - 1 - copied;
+        }
+
+        long ret = bpf_probe_read_user(info->sql + copied, to_copy, packet + offset);
+        if (ret < 0) {
+            break;
+        }
+
+        copied += to_copy;
+        offset += to_copy;
+        remaining -= to_copy;
+    }
+
+    info->sql_len = copied;
+    if (copied < MAX_SQL_LEN) {
+        info->sql[copied] = '\0';
+    } else {
+        info->sql[MAX_SQL_LEN - 1] = '\0';
+    }
 }
 
 static inline void extract_thd_info(void *thd, struct start_info *info) {
@@ -127,19 +184,29 @@ static inline void extract_thd_info(void *thd, struct start_info *info) {
     }
 }
 
+static inline u64 get_config_threshold() {
+    u32 key = 0;
+    u64 *threshold = bpf_map_lookup_elem(&config_map, &key);
+    if (threshold) {
+        return *threshold;
+    }
+    return SLOW_QUERY_THRESHOLD_NS;
+}
+
 SEC("uprobe/dispatch_command")
 int BPF_UPROBE(dispatch_command_entry, void *thd, unsigned int command, char *packet, unsigned int packet_len) {
     u64 tid = bpf_get_current_pid_tgid();
-    u32 pid = tid >> 32;
-    struct start_info info = {};
 
+    if (command != COM_QUERY && command != COM_STMT_PREPARE && command != COM_STMT_EXECUTE) {
+        return 0;
+    }
+
+    struct start_info info = {};
     info.start_ns = bpf_ktime_get_ns();
     info.command = command;
 
-    if (command == COM_QUERY || command == COM_STMT_PREPARE || command == COM_STMT_EXECUTE) {
-        if (packet && packet_len > 0) {
-            read_sql_from_packet(packet, packet_len, info.sql, MAX_SQL_LEN, &info.sql_len);
-        }
+    if (packet && packet_len > 1) {
+        read_sql_from_packet_v2(packet, packet_len, &info);
     }
 
     extract_thd_info(thd, &info);
@@ -159,6 +226,14 @@ int BPF_URETPROBE(dispatch_command_exit, int ret) {
         return 0;
     }
 
+    u64 duration = now - info->start_ns;
+    u64 threshold = get_config_threshold();
+
+    if (duration < threshold && info->sql_len < 1024) {
+        bpf_map_delete_elem(&start_map, &tid);
+        return 0;
+    }
+
     struct event *event = bpf_ringbuf_reserve(&events, sizeof(struct event), 0);
     if (!event) {
         bpf_map_delete_elem(&start_map, &tid);
@@ -169,7 +244,7 @@ int BPF_URETPROBE(dispatch_command_exit, int ret) {
     event->tid = (u32)tid;
     event->start_ns = info->start_ns;
     event->end_ns = now;
-    event->duration_ns = now - info->start_ns;
+    event->duration_ns = duration;
     event->command = info->command;
     event->client_port = info->client_port;
     event->sql_len = info->sql_len;
@@ -179,7 +254,7 @@ int BPF_URETPROBE(dispatch_command_exit, int ret) {
     __builtin_memcpy(event->client_ip, info->client_ip, MAX_IP_LEN);
     __builtin_memcpy(event->sql, info->sql, MAX_SQL_LEN);
 
-    bpf_ringbuf_submit(event, 0);
+    bpf_ringbuf_submit(event, BPF_RB_NO_WAKEUP);
     bpf_map_delete_elem(&start_map, &tid);
 
     return 0;

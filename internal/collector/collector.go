@@ -27,12 +27,13 @@ type bpfEvent struct {
 	EndNs      uint64
 	DurationNs uint64
 	Command    uint32
+	SqlLen     uint32
+	ClientPort uint16
+	Pad        [2]byte
 	User       [128]byte
 	Db         [128]byte
 	ClientIp   [48]byte
-	ClientPort uint16
-	SqlLen     uint32
-	Sql        [4096]byte
+	Sql        [16384]byte
 }
 
 type Collector struct {
@@ -42,6 +43,8 @@ type Collector struct {
 	ringbuf       *ringbuf.Reader
 	mysqlPath     string
 	mysqlPid      int
+	symbolOffset  uint64
+	thresholdNs   uint64
 	running       bool
 	eventChan     chan *model.Event
 }
@@ -52,25 +55,38 @@ func NewCollector() *Collector {
 	}
 }
 
-func (c *Collector) AttachByPort(port int) error {
+func (c *Collector) AttachByPort(port int, thresholdMs float64) error {
 	pid, err := findMySQLProcessByPort(port)
 	if err != nil {
 		return fmt.Errorf("find mysql process by port %d: %w", port, err)
 	}
-	return c.AttachByPID(pid)
+	return c.AttachByPID(pid, thresholdMs)
 }
 
-func (c *Collector) AttachByPID(pid int) error {
+func (c *Collector) AttachByPID(pid int, thresholdMs float64) error {
 	mysqlPath, err := findMySQLBinaryByPID(pid)
 	if err != nil {
 		return fmt.Errorf("find mysql binary path: %w", err)
 	}
-	return c.Attach(mysqlPath, pid)
+	return c.Attach(mysqlPath, pid, 0, thresholdMs)
 }
 
-func (c *Collector) Attach(mysqlBinary string, pid int) error {
+func (c *Collector) AttachWithOffset(port int, offset uint64, thresholdMs float64) error {
+	pid, err := findMySQLProcessByPort(port)
+	if err != nil {
+		return fmt.Errorf("find mysql process by port %d: %w", port, err)
+	}
+	mysqlPath, err := findMySQLBinaryByPID(pid)
+	if err != nil {
+		return fmt.Errorf("find mysql binary path: %w", err)
+	}
+	return c.Attach(mysqlPath, pid, offset, thresholdMs)
+}
+
+func (c *Collector) Attach(mysqlBinary string, pid int, offset uint64, thresholdMs float64) error {
 	c.mysqlPath = mysqlBinary
 	c.mysqlPid = pid
+	c.thresholdNs = uint64(thresholdMs * 1e6)
 
 	spec, err := bpf.LoadMysql()
 	if err != nil {
@@ -82,12 +98,19 @@ func (c *Collector) Attach(mysqlBinary string, pid int) error {
 		return fmt.Errorf("load and assign eBPF objects: %w", err)
 	}
 
-	offset, err := findSymbolOffset(mysqlBinary, "_Z16dispatch_commandP3THDjPcj")
-	if err != nil {
-		offset, err = findSymbolOffset(mysqlBinary, "dispatch_command")
+	if offset == 0 {
+		offset, err = findSymbolOffset(mysqlBinary, "_Z16dispatch_commandP3THDjPcj")
 		if err != nil {
-			return fmt.Errorf("find dispatch_command symbol: %w", err)
+			offset, err = findSymbolOffset(mysqlBinary, "dispatch_command")
+			if err != nil {
+				return fmt.Errorf("find dispatch_command symbol: %w", err)
+			}
 		}
+	}
+	c.symbolOffset = offset
+
+	if err := c.setThreshold(c.thresholdNs); err != nil {
+		log.Printf("warning: set threshold to eBPF: %v", err)
 	}
 
 	exec, err := link.OpenExecutable(mysqlBinary)
@@ -121,6 +144,14 @@ func (c *Collector) Attach(mysqlBinary string, pid int) error {
 	return nil
 }
 
+func (c *Collector) setThreshold(thresholdNs uint64) error {
+	if c.objs == nil || c.objs.ConfigMap == nil {
+		return fmt.Errorf("config map not available")
+	}
+	key := uint32(0)
+	return c.objs.ConfigMap.Put(&key, &thresholdNs)
+}
+
 func (c *Collector) eventLoop() {
 	for c.running {
 		record, err := c.ringbuf.Read()
@@ -147,7 +178,7 @@ func (c *Collector) eventLoop() {
 
 func parseEvent(data []byte) (*model.Event, error) {
 	if len(data) < int(unsafe.Sizeof(bpfEvent{})) {
-		return nil, fmt.Errorf("data too short: %d bytes", len(data))
+		return nil, fmt.Errorf("data too short: %d bytes (expected %d)", len(data), unsafe.Sizeof(bpfEvent{}))
 	}
 
 	var bpfEvt bpfEvent
@@ -279,6 +310,30 @@ func findMySQLBinaryByPID(pid int) (string, error) {
 }
 
 func findSymbolOffset(binaryPath string, symbolName string) (uint64, error) {
+	offset, err := findSymbolOffsetELF(binaryPath, symbolName)
+	if err == nil {
+		return offset, nil
+	}
+
+	if symbolName == "dispatch_command" {
+		mangledName := "_Z16dispatch_commandP3THDjPcj"
+		offset, err = findSymbolOffsetELF(binaryPath, mangledName)
+		if err == nil {
+			return offset, nil
+		}
+
+		offset, err = findSymbolOffsetByPattern(binaryPath)
+		if err == nil {
+			return offset, nil
+		}
+	}
+
+	return 0, fmt.Errorf("symbol %q not found in %s (binary may be stripped), "+
+		"try: 1) install mysql-dbgsym package, 2) use --symbol-offset flag, "+
+		"3) check if mysqld binary has debug symbols", symbolName, binaryPath)
+}
+
+func findSymbolOffsetELF(binaryPath, symbolName string) (uint64, error) {
 	f, err := elf.Open(binaryPath)
 	if err != nil {
 		return 0, fmt.Errorf("open elf file: %w", err)
@@ -286,19 +341,123 @@ func findSymbolOffset(binaryPath string, symbolName string) (uint64, error) {
 	defer f.Close()
 
 	symbols, err := f.Symbols()
+	if err == nil {
+		for _, sym := range symbols {
+			if sym.Name == symbolName && sym.Size > 0 {
+				return sym.Value, nil
+			}
+		}
+	}
+
+	dynSymbols, err := f.DynamicSymbols()
+	if err == nil {
+		for _, sym := range dynSymbols {
+			if sym.Name == symbolName && sym.Size > 0 {
+				return sym.Value, nil
+			}
+		}
+	}
+
+	for _, sec := range f.Sections {
+		if sec.Name == ".symtab" || sec.Name == ".dynsym" {
+			symtabSection := sec
+			var strtabSection *elf.Section
+			for _, s := range f.Sections {
+				if s.Name == ".strtab" || s.Name == ".dynstr" {
+					strtabSection = s
+					break
+				}
+			}
+			if strtabSection == nil {
+				continue
+			}
+
+			strtabData, err := strtabSection.Data()
+			if err != nil {
+				continue
+			}
+
+			symtabData, err := symtabSection.Data()
+			if err != nil {
+				continue
+			}
+
+			symSize := int(symtabSection.Entsize)
+			if symSize == 0 {
+				continue
+			}
+
+			for i := 0; i+symSize <= len(symtabData); i += symSize {
+				nameOffset, value, size := readSymbolEntry(symtabData[i:i+symSize], f.Class)
+				if nameOffset < uint32(len(strtabData)) {
+					name := readCString(strtabData[nameOffset:])
+					if name == symbolName && size > 0 {
+						return value, nil
+					}
+				}
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("symbol %q not found", symbolName)
+}
+
+func readSymbolEntry(data []byte, class elf.Class) (nameOffset uint32, value uint64, size uint64) {
+	if class == elf.ELFCLASS64 {
+		nameOffset = binary.LittleEndian.Uint32(data[0:4])
+		value = binary.LittleEndian.Uint64(data[8:16])
+		size = binary.LittleEndian.Uint64(data[32:40])
+	} else {
+		nameOffset = binary.LittleEndian.Uint32(data[0:4])
+		value = uint64(binary.LittleEndian.Uint32(data[4:8]))
+		size = uint64(binary.LittleEndian.Uint32(data[16:20]))
+	}
+	return
+}
+
+func readCString(data []byte) string {
+	for i, b := range data {
+		if b == 0 {
+			return string(data[:i])
+		}
+	}
+	return string(data)
+}
+
+func findSymbolOffsetByPattern(binaryPath string) (uint64, error) {
+	data, err := os.ReadFile(binaryPath)
 	if err != nil {
-		dynSymbols, dynErr := f.DynamicSymbols()
-		if dynErr != nil {
-			return 0, fmt.Errorf("read symbols: %w, dynamic symbols: %w", err, dynErr)
-		}
-		symbols = dynSymbols
+		return 0, fmt.Errorf("read binary: %w", err)
 	}
 
-	for _, sym := range symbols {
-		if sym.Name == symbolName {
-			return sym.Value, nil
+	patterns := [][]byte{
+		{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
+		{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
+		{0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5, 0x41, 0x57},
+	}
+
+	for _, pattern := range patterns {
+		offset := findPattern(data, pattern)
+		if offset > 0 {
+			return uint64(offset), nil
 		}
 	}
 
-	return 0, fmt.Errorf("symbol %q not found in %s", symbolName, binaryPath)
+	return 0, fmt.Errorf("pattern not found")
+}
+
+func findPattern(data, pattern []byte) int {
+	for i := 0; i <= len(data)-len(pattern); i++ {
+		match := true
+		for j := 0; j < len(pattern); j++ {
+			if data[i+j] != pattern[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
 }

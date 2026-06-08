@@ -16,9 +16,10 @@ import (
 )
 
 var (
-	mysqlPort int
-	mysqlPID  int
-	duration  time.Duration
+	mysqlPort    int
+	mysqlPID     int
+	duration     time.Duration
+	symbolOffset uint64
 )
 
 var mysqlCmd = &cobra.Command{
@@ -39,6 +40,7 @@ func init() {
 	mysqlCmd.Flags().IntVarP(&mysqlPort, "port", "p", 3306, "MySQL port to monitor")
 	mysqlCmd.Flags().IntVar(&mysqlPID, "pid", 0, "MySQL process ID (optional, auto-detected by port)")
 	mysqlCmd.Flags().DurationVar(&duration, "duration", 0, "Monitoring duration (e.g., 1h, 30m). 0 means run until interrupted")
+	mysqlCmd.Flags().Uint64Var(&symbolOffset, "symbol-offset", 0, "Manual symbol offset for dispatch_command (for stripped binaries)")
 	rootCmd.AddCommand(mysqlCmd)
 }
 
@@ -54,10 +56,13 @@ func runMySQL(cmd *cobra.Command, args []string) error {
 	var err error
 	if mysqlPID > 0 {
 		fmt.Printf("Attaching to MySQL process PID %d...\n", mysqlPID)
-		err = c.AttachByPID(mysqlPID)
+		err = c.AttachByPID(mysqlPID, thresholdMs)
+	} else if symbolOffset > 0 {
+		fmt.Printf("Attaching to MySQL on port %d with symbol offset 0x%x...\n", mysqlPort, symbolOffset)
+		err = c.AttachWithOffset(mysqlPort, symbolOffset, thresholdMs)
 	} else {
 		fmt.Printf("Attaching to MySQL on port %d...\n", mysqlPort)
-		err = c.AttachByPort(mysqlPort)
+		err = c.AttachByPort(mysqlPort, thresholdMs)
 	}
 	if err != nil {
 		return fmt.Errorf("attach to MySQL: %w (note: this tool requires Linux kernel >= 5.8 with BPF support and root privileges)", err)

@@ -7,10 +7,10 @@ import (
 )
 
 const (
-	MaxSQLLen  = 4096
-	MaxUserLen = 128
-	MaxDBLen   = 128
-	MaxIPLen   = 48
+	MaxSQLLen   = 16384
+	MaxUserLen  = 128
+	MaxDBLen    = 128
+	MaxIPLen    = 48
 )
 
 type Event struct {

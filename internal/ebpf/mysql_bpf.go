@@ -14,6 +14,7 @@ type MysqlObjects struct {
 	DispatchCommandExit  *ebpf.Program `ebpf:"dispatch_command_exit"`
 	StartMap             *ebpf.Map     `ebpf:"start_map"`
 	Events               *ebpf.Map     `ebpf:"events"`
+	ConfigMap            *ebpf.Map     `ebpf:"config_map"`
 }
 
 func (m *MysqlObjects) Close() error {
@@ -28,6 +29,9 @@ func (m *MysqlObjects) Close() error {
 	}
 	if m.Events != nil {
 		m.Events.Close()
+	}
+	if m.ConfigMap != nil {
+		m.ConfigMap.Close()
 	}
 	return nil
 }

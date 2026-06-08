@@ -17,10 +17,11 @@ import (
 )
 
 var (
-	sinceStr   string
-	outputFile string
-	reportPort int
-	reportPID  int
+	sinceStr        string
+	outputFile      string
+	reportPort      int
+	reportPID       int
+	reportSymbolOff uint64
 )
 
 var reportCmd = &cobra.Command{
@@ -45,6 +46,7 @@ func init() {
 	reportCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file path (default: stdout)")
 	reportCmd.Flags().IntVarP(&reportPort, "port", "p", 3306, "MySQL port to monitor")
 	reportCmd.Flags().IntVar(&reportPID, "pid", 0, "MySQL process ID (optional, auto-detected by port)")
+	reportCmd.Flags().Uint64Var(&reportSymbolOff, "symbol-offset", 0, "Manual symbol offset for dispatch_command (for stripped binaries)")
 	rootCmd.AddCommand(reportCmd)
 }
 
@@ -68,10 +70,13 @@ func runReport(cmd *cobra.Command, args []string) error {
 
 	if reportPID > 0 {
 		fmt.Printf("Attaching to MySQL process PID %d...\n", reportPID)
-		err = c.AttachByPID(reportPID)
+		err = c.AttachByPID(reportPID, thresholdMs)
+	} else if reportSymbolOff > 0 {
+		fmt.Printf("Attaching to MySQL on port %d with symbol offset 0x%x...\n", reportPort, reportSymbolOff)
+		err = c.AttachWithOffset(reportPort, reportSymbolOff, thresholdMs)
 	} else {
 		fmt.Printf("Attaching to MySQL on port %d...\n", reportPort)
-		err = c.AttachByPort(reportPort)
+		err = c.AttachByPort(reportPort, thresholdMs)
 	}
 	if err != nil {
 		return fmt.Errorf("attach to MySQL: %w (note: this tool requires Linux kernel >= 5.8 with BPF support and root privileges)", err)
